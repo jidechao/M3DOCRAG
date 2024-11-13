@@ -27,7 +27,7 @@ class DocumentPage:
     """Represents a single page from a document with its metadata."""
     doc_id: str
     page_num: int
-    image: Image.Image  # PIL Image
+    image: Image.Image  
 
 @dataclass
 class RetrievedPage:
@@ -183,10 +183,9 @@ class M3DOCRAG:
                 torch.cuda.empty_cache()
 
             dummy_image = Image.new("RGB", (448, 448), (255, 255, 255))
-            query_batch = process_queries(
+            query_batch = self.process_images(
                 self.retrieval_processor,
-                [query],
-                dummy_image
+                [dummy_image]
             )
 
             with torch.no_grad():
@@ -219,8 +218,21 @@ class M3DOCRAG:
             return []
 
     def format_chat_messages(self, query: str, retrieved_pages: List[RetrievedPage]) -> List[Dict[str, Any]]:
-        """Format the query and retrieved pages as chat messages for Qwen2-VL."""
+        """Format the query and retrieved pages with forced direct response."""
         messages = [{
+            "role": "system",
+            "content": """You are a document analyzer that ONLY gives two types of responses:
+    1. If you find the EXACT information: Respond with ONLY that specific information
+    2. If you cannot find the EXACT information: Respond with EXACTLY and ONLY this phrase: "I cannot find this information in the provided document pages."
+
+    DO NOT:
+    - Explain your limitations
+    - Talk about AI or models
+    - Make assumptions
+    - Give partial information
+    - Provide multiple answers
+    - Add any explanations"""
+        }, {
             "role": "user",
             "content": [
                 *[{
@@ -229,88 +241,80 @@ class M3DOCRAG:
                 } for page in retrieved_pages],
                 {
                     "type": "text",
-                    "text": query
+                    "text": f"IMPORTANT: Give ONLY the exact answer found in these document pages for: {query}"
                 }
             ]
         }]
         return messages
+    
+    def process_images(self, processor, pages):
+        """Process images with proper token handling."""
+        n_images = len(pages)
+        text = "<image>" * n_images + "<bos>"
+        
+        return processor(
+            text=text,
+            images=pages,
+            return_tensors="pt"
+        )
 
     def answer(self, query: str, retrieved_pages: List[RetrievedPage]) -> str:
-        """Generate answer using Qwen2-VL with fixed token handling."""
+        """Generate answer with forced direct response handling."""
         try:
-            max_batch_size = 1
-            all_retrieved_pages = retrieved_pages
-            final_answer = ""
+            messages = self.format_chat_messages(query, retrieved_pages)
+            
+            with torch.cuda.device(self.qa_device):
+                torch.cuda.empty_cache()
 
-            for i in range(0, len(all_retrieved_pages), max_batch_size):
-                batch_pages = all_retrieved_pages[i:i + max_batch_size]
-                
-                with torch.cuda.device(self.qa_device):
-                    torch.cuda.empty_cache()
-                
-                messages = [{
-                    "role": "user",
-                    "content": [
-                        *[{
-                            "type": "image",
-                            "image": page.page.image
-                        } for page in batch_pages],
-                        {
-                            "type": "text",
-                            "text": query if i == 0 else "Continue analyzing the following pages for the same query."
-                        }
-                    ]
-                }]
+            text = self.qa_processor.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
 
-                text = self.qa_processor.apply_chat_template(
-                    messages, 
-                    tokenize=False, 
-                    add_generation_prompt=True
+            image_inputs, video_inputs = process_vision_info(messages)
+
+            inputs = self.qa_processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+                truncation=True,
+                max_length=2048
+            )
+
+            model_inputs = {
+                k: v.to(self.qa_device)
+                for k, v in inputs.items()
+            }
+
+            with torch.no_grad():
+                generated_ids = self.qa_model.generate(
+                    **model_inputs,
+                    max_new_tokens=30,  
+                    do_sample=True,
+                    temperature=0.1,
+                    top_p=0.1,
+                    pad_token_id=self.qa_processor.tokenizer.pad_token_id,
+                    eos_token_id=self.qa_processor.tokenizer.eos_token_id,
+                    repetition_penalty=1.5,
+                    no_repeat_ngram_size=4,
                 )
+                
+                raw_answer = self.qa_processor.decode(
+                    generated_ids[0, len(model_inputs['input_ids'][0]):],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True
+                ).strip()
 
-                image_inputs, video_inputs = process_vision_info(messages)
+            final_answer = raw_answer
 
-                inputs = self.qa_processor(
-                    text=[text],
-                    images=image_inputs,
-                    videos=video_inputs,
-                    padding=True,
-                    return_tensors="pt"
-                )
+            del model_inputs, generated_ids
+            with torch.cuda.device(self.qa_device):
+                torch.cuda.empty_cache()
 
-                model_inputs = {
-                    k: v.to(self.qa_device)
-                    for k, v in inputs.items()
-                }
-
-                input_length = model_inputs['input_ids'].shape[1]
-
-                with torch.no_grad():
-                    generated_ids = self.qa_model.generate(
-                        **model_inputs,
-                        max_new_tokens=100,
-                        do_sample=True,
-                        temperature=0.7,
-                        top_p=0.8,
-                        pad_token_id=self.qa_processor.tokenizer.pad_token_id,
-                        eos_token_id=self.qa_processor.tokenizer.eos_token_id,
-                    )
-                    
-                    generated_ids_trimmed = generated_ids[0, input_length:]
-                    
-                    batch_answer = self.qa_processor.decode(
-                        generated_ids_trimmed,
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=False
-                    )
-
-                    final_answer += batch_answer + " "
-
-                del model_inputs, generated_ids, generated_ids_trimmed
-                with torch.cuda.device(self.qa_device):
-                    torch.cuda.empty_cache()
-
-            return final_answer.strip()
+            return final_answer
 
         except Exception as e:
             print(f"Error in answer generation: {str(e)}")
