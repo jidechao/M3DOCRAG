@@ -59,7 +59,7 @@ The system uses the following models:
 
 1. Start the interactive shell:
 ```bash
-python m3docrag.py
+python m3-doc-rag.py
 ```
 
 2. Initialize the system:
