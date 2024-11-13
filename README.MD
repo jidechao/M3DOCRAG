@@ -33,8 +33,7 @@ source venv/bin/activate  # Linux/Mac
 
 2. Install dependencies:
 ```bash
-pip install torch transformers pdf2image Pillow faiss-cpu tqdm
-pip install git+https://github.com/vidore/colpali-engine.git
+pip install -r requirements.txt
 ```
 
 3. Install system dependencies for PDF handling:
